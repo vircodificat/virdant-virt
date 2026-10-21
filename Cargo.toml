@@ -1,0 +1,13 @@
+[package]
+name = "virt"
+version = "0.1.0"
+edition = "2021"
+
+#> `virt` — build and run simulators for the virtual FPGA platform
+#> (`virt::Virt`, defined in virdant/lib/virt.vir).
+#>
+#> See README.md for usage.
+
+[[bin]]
+name = "virt"
+path = "src/main.rs"
