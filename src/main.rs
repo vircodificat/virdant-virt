@@ -1,4 +1,5 @@
-//! `virt` — build and run simulators for the virtual FPGA platform (`virt::Virt`).
+//! `virt` — build and run simulators for the virtual FPGA platforms
+//! (`virt::Virt`, `virt::VirtVga`).
 //!
 //! Usage:
 //!   virt build [--top=<TOP>] [--build-dir=<DIR>]
@@ -9,6 +10,13 @@
 //!
 //! The top module defaults to `[prog] top` from Virdant.toml (e.g.
 //! `top::Top` → the simple name `Top`); `--top` overrides it.
+//!
+//! Which board the simulator emulates is decided by the platform the top
+//! module implements (its `for` clause), read back from the manifest
+//! `vir build` emits at `build/virmanifest.json`:
+//!
+//!   - `virt::Virt`   → assets/sim.cpp    — UART, SPI flash, exit.
+//!   - `virt::VirtVga` → assets/sim_vga.cpp — Virt + a VGA monitor (SDL2).
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -60,6 +68,158 @@ fn build(args: &[String]) {
     build_with(&top, &build_dir);
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Platform manifest (`vir build` → build/virmanifest.json)
+// ─────────────────────────────────────────────────────────────────────
+
+/// The platform metadata `vir build` emits that this tool needs: which
+/// `virt::` platform the top module implements (this selects the board
+/// the simulator emulates) and the platform clock frequency (the UART
+/// baud and VGA timing base).  A std-only scan of the JSON this tool
+/// itself consumes — the manifest is written by `vir build`, so simple
+/// field extraction suffices (no nested objects in these fields).
+struct Manifest {
+    /// Simple platform name, e.g. `"VirtVga"`.
+    platform: String,
+    /// FPGA family string, e.g. `"virt"`.
+    fpga: String,
+    /// Primary clock frequency in Hz, e.g. `50000000`.
+    clock_hz: u64,
+}
+
+/// The virtual boards, and the fixed harness that emulates each.  Both
+/// harnesses compile against the same Verilator model class `Vvirt`
+/// (`virt build` pins the `--prefix`), so the top module's name is free.
+#[derive(Clone, Copy)]
+enum Board {
+    /// `virt::Virt` — UART (stdin/stdout), 16 MiB SPI flash, exit port.
+    /// Emulated by `assets/sim.cpp` (overridable via $VIRT_SIM_CPP).
+    Virt,
+    /// `virt::VirtVga` — `Virt` plus a Nexys4-style VGA connector
+    /// (RGB444 + HSYNC/VSYNC, either polarity) rendered with SDL2.
+    /// Emulated by `assets/sim_vga.cpp` (overridable via $VIRT_SIM_VGA_CPP).
+    VirtVga,
+}
+
+impl Board {
+    /// The fixed C++ harness source for this board.
+    fn harness_path(self) -> PathBuf {
+        let (name, override_env) = match self {
+            Board::Virt => ("sim.cpp", "VIRT_SIM_CPP"),
+            Board::VirtVga => ("sim_vga.cpp", "VIRT_SIM_VGA_CPP"),
+        };
+        match env::var(override_env) {
+            Ok(p) => PathBuf::from(p),
+            Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets").join(name),
+        }
+    }
+}
+
+/// Read the manifest, or exit with a diagnostic.
+fn read_manifest(build_dir: &Path) -> Manifest {
+    match try_read_manifest(build_dir) {
+        Some(manifest) => manifest,
+        None => {
+            let path = build_dir.join("virmanifest.json");
+            if !path.is_file() {
+                eprintln!(
+                    "virt: no {} — was `vir build` run in a project whose [prog] top implements a platform?",
+                    path.display()
+                );
+            } else {
+                eprintln!("virt: cannot parse {}", path.display());
+            }
+            eprintln!(
+                "virt: this tool simulates the virt FPGA family: `for virt::Virt` (harness sim.cpp) or `for virt::VirtVga` (harness sim_vga.cpp)"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Read the manifest, or `None` if missing/unparseable.
+fn try_read_manifest(build_dir: &Path) -> Option<Manifest> {
+    let text = std::fs::read_to_string(build_dir.join("virmanifest.json")).ok()?;
+    Some(Manifest {
+        platform: manifest_str_field(&text, "platform_name")?,
+        fpga: manifest_str_field(&text, "fpga")?,
+        clock_hz: manifest_num_field(&text, "clock_hz")?,
+    })
+}
+
+/// The value of a string field, scanned from the manifest text.
+fn manifest_str_field(text: &str, key: &str) -> Option<String> {
+    let rest = manifest_value_of(text, key)?;
+    let mut chars = rest.chars();
+    (chars.next() == Some('"'))
+        .then(|| chars.take_while(|&c| c != '"').collect())
+}
+
+/// The value of a natural-number field, scanned from the manifest text.
+fn manifest_num_field(text: &str, key: &str) -> Option<u64> {
+    let rest = manifest_value_of(text, key)?;
+    rest.chars()
+        .take_while(char::is_ascii_digit)
+        .collect::<String>()
+        .parse()
+        .ok()
+}
+
+/// The text just after `"<key>" :`, trimmed.  (Scans the first match;
+/// the manifest has no repeated keys at this depth.)
+fn manifest_value_of<'a>(text: &'a str, key: &str) -> Option<&'a str> {
+    let key_pattern = format!("\"{key}\"");
+    let key_pos = text.find(&key_pattern)?;
+    let rest = text[key_pos + key_pattern.len()..].trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    Some(rest)
+}
+
+/// Which board to emulate, from the manifest — or exit: this tool only
+/// simulates the `virt` FPGA family, and only the boards it has
+/// harnesses for.
+fn board_for(manifest: &Manifest) -> Board {
+    if manifest.fpga != "virt" {
+        eprintln!(
+            "virt: platform `{}` targets FPGA family `{}`, which this tool cannot simulate",
+            manifest.platform, manifest.fpga
+        );
+        eprintln!("virt: this tool simulates the virt FPGA family only");
+        std::process::exit(1);
+    }
+    match manifest.platform.as_str() {
+        "Virt" => Board::Virt,
+        "VirtVga" => Board::VirtVga,
+        other => {
+            eprintln!(
+                "virt: platform `{other}` is not a simulated virtual board (expected virt::Virt or virt::VirtVga)"
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Flags from `sdl2-config`, whitespace-split (its output is plain
+/// `-I…`/`-L… -l…` flags; no quoting).
+fn sdl2_flags(which: &str) -> Vec<String> {
+    let output = Command::new("sdl2-config")
+        .arg(which)
+        .output()
+        .unwrap_or_else(|e| {
+            eprintln!("virt: cannot run sdl2-config: {e}");
+            eprintln!("virt: the virt::VirtVga harness renders with SDL2 — install it (e.g. `libsdl2-dev` on Debian)");
+            std::process::exit(1);
+        });
+    if !output.status.success() {
+        eprintln!("virt: sdl2-config {which} failed");
+        std::process::exit(1);
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .map(String::from)
+        .collect()
+}
+
 fn build_with(top: &str, build_dir: &Path) {
     // ── Step 1: regenerate the Verilog with `vir build` ──
     eprintln!("virt: running vir build...");
@@ -99,23 +259,36 @@ fn build_with(top: &str, build_dir: &Path) {
         build_dir.display()
     );
 
-    // Locate the fixed harness.  Prefer $VIRT_SIM_CPP (override); otherwise
-    // use the sim.cpp shipped next to this crate's source.
-    let sim_cpp: PathBuf = match env::var("VIRT_SIM_CPP") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sim.cpp"),
+    // ── Step 3: read the platform manifest and pick the board harness ──
+    // The top module's `for` clause (resolved by `vir build` into the
+    // manifest) decides which board this build simulates.
+    let manifest = read_manifest(build_dir);
+    let board = board_for(&manifest);
+    let sim_cpp = board.harness_path();
+    let harness_name = |p: &Path| {
+        p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
     };
     if !sim_cpp.is_file() {
-        eprintln!("virt: sim.cpp not found at {}", sim_cpp.display());
+        eprintln!(
+            "virt: {} harness not found at {}",
+            harness_name(&sim_cpp),
+            sim_cpp.display()
+        );
         std::process::exit(1);
     }
+    eprintln!(
+        "virt: platform virt::{} ({} MHz) — harness {}",
+        manifest.platform,
+        manifest.clock_hz / 1_000_000,
+        sim_cpp.display()
+    );
 
     // Find Verilator's include directory.
     let verilator_root = verilator_root();
 
     // Verilator: --prefix Vvirt pins the generated class name to `Vvirt`,
-    // regardless of the top module's name, so the fixed sim.cpp works for
-    // any design.
+    // regardless of the top module's name, so the fixed harnesses
+    // (sim.cpp / sim_vga.cpp) work for any design.
     let mdir = build_dir.join("virt");
     let mut cmd = Command::new("verilator");
     // --trace emits VerilatedVcdC support so the harness can record VCDs
@@ -157,9 +330,24 @@ fn build_with(top: &str, build_dir: &Path) {
     cmd.arg("-O2")
         .arg("-I").arg(&mdir)
         .arg("-I").arg(verilator_root.join("include"))
-        .arg("-I").arg(verilator_root.join("include/vltstd"))
-        .arg(&sim_cpp)
-        .arg(&lib)
+        .arg("-I").arg(verilator_root.join("include/vltstd"));
+    if let Board::VirtVga = board {
+        // The harness renders the VGA output with SDL2 and derives its
+        // UART baud and sync-timing expectations from the platform
+        // clock (the manifest's clock_hz from the platform's
+        // @period_ns).
+        cmd.arg(format!("-DVIRT_CLOCK_HZ={}ull", manifest.clock_hz));
+        for flag in sdl2_flags("--cflags") {
+            cmd.arg(&flag);
+        }
+    }
+    cmd.arg(&sim_cpp);
+    if let Board::VirtVga = board {
+        for flag in sdl2_flags("--libs") {
+            cmd.arg(&flag);
+        }
+    }
+    cmd.arg(&lib)
         .args(&runtime_objs)
         .arg("-o").arg(&out);
     eprintln!("virt: linking {}...", out.display());
@@ -214,11 +402,20 @@ fn run(args: &[String]) {
 }
 
 /// True when the simulator binary is missing or older than any design
-/// source (src/*.vir, ext/*.sv).
+/// source (src/*.vir, ext/*.sv, and the board harness chosen by the
+/// manifest).
 fn needs_rebuild(bin: &Path, build_dir: &Path) -> bool {
     if !bin.is_file() {
         return true;
     }
+
+    // Which harness this binary was built from (which board it
+    // emulates): a stale or missing manifest forces a rebuild, so the
+    // next build regenerates it.
+    let Some(manifest) = try_read_manifest(build_dir) else {
+        return true;
+    };
+    let board = board_for(&manifest);
     let bin_mtime = mtime(bin);
 
     let mut sources: Vec<PathBuf> = vec![];
@@ -234,14 +431,12 @@ fn needs_rebuild(bin: &Path, build_dir: &Path) -> bool {
             }
         }
     }
-    // The fixed harness is a source too: a sim.cpp change must trigger a
-    // rebuild even when no .vir/.sv file changed.
-    let harness: PathBuf = match env::var("VIRT_SIM_CPP") {
-        Ok(p) => PathBuf::from(p),
-        Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("assets").join("sim.cpp"),
-    };
-    sources.push(harness);
-    let _ = build_dir;
+    // The fixed harness is a source too: a sim.cpp/sim_vga.cpp change
+    // must trigger a rebuild even when no .vir/.sv file changed.  The
+    // manifest itself is deliberately NOT a rebuild source: `vir build`
+    // rewrites it every run, so its mtime would force a rebuild every
+    // time (its content only changes when a source does).
+    sources.push(board.harness_path());
 
     sources.iter().any(|p| mtime(p) > bin_mtime)
 }
